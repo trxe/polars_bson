@@ -121,13 +121,13 @@ impl BsonScan {
 
 impl AnonymousScan for BsonScan {
     fn allows_predicate_pushdown(&self) -> bool {
-        true
+        false
     }
     fn allows_projection_pushdown(&self) -> bool {
-        true
+        false
     }
     fn allows_slice_pushdown(&self) -> bool {
-        true
+        false
     }
     fn scan(&self, scan_opts: polars::prelude::AnonymousScanArgs) -> PolarsResult<DataFrame> {
         let schema = scan_opts.schema;
@@ -161,13 +161,22 @@ pub struct BsonScanOptions {
     pub n_rows: Option<usize>,
 }
 
+impl BsonScanOptions {
+    fn new(infer_schema_length: Option<usize>, n_rows: Option<usize>) -> Self {
+        Self {
+            infer_schema_length,
+            n_rows,
+        }
+    }
+}
+
 pub trait MongoLazyReader {
     fn scan_mongo_collection(
         collection: Collection<BsonDoc>,
         find_doc: BsonDoc,
-        options: &BsonScanOptions,
+        options: BsonScanOptions,
     ) -> PolarsResult<LazyFrame> {
-        let f = BsonScan::new(collection, Some(find_doc), options);
+        let f = BsonScan::new(collection, Some(find_doc), &options);
 
         let args = ScanArgsAnonymous {
             name: "MONGO SCAN",
@@ -181,3 +190,65 @@ pub trait MongoLazyReader {
 }
 
 impl MongoLazyReader for LazyFrame {}
+
+#[cfg(test)]
+mod tests {
+    use bson::doc;
+    use chrono::Utc;
+    use polars::prelude::LazyFrame;
+
+    use crate::{MongoLazyReader, common::BsonDoc};
+
+    const MONGO_URI: &str = "mongodb://localhost:27017";
+    const MONGO_DEFAULT_DB: &str = "csdb";
+    #[test]
+    fn valid_bigger_collection_mongo() {
+        dotenvy::dotenv().unwrap();
+        let modb = match std::env::var("MONGO_LIVEDB") {
+            Ok(x) => x,
+            Err(_) => {
+                return ();
+            }
+        };
+        let client = mongodb::sync::Client::with_uri_str(modb).expect("client not built");
+        let db = client.database(MONGO_DEFAULT_DB);
+        let collection = db.collection::<BsonDoc>("players");
+        let lf = LazyFrame::scan_mongo_collection(
+            collection.clone(),
+            doc! {"status": "NHL", "team.id": 1},
+            crate::BsonScanOptions::new(None, None),
+        );
+        let df = lf.unwrap().collect().unwrap();
+
+        println!("{:?}", df);
+    }
+
+    #[test]
+    fn valid_default_config_mongo() {
+        let client = mongodb::sync::Client::with_uri_str(MONGO_URI).expect("client not built");
+        let db = client.database(MONGO_DEFAULT_DB);
+        let collection = db.collection::<BsonDoc>("persons");
+        let chrono_dt: chrono::DateTime<Utc> = "2014-11-28T12:00:09Z".parse().unwrap();
+        collection
+            .insert_many([
+                doc! { "name": "foo", "id": 1, "desc": "bar", "a_date": chrono_dt },
+                doc! { "name": "dee", "id": 2, "desc": "bee" },
+            ])
+            .run()
+            .unwrap();
+
+        let lf = LazyFrame::scan_mongo_collection(
+            collection.clone(),
+            doc! {},
+            crate::BsonScanOptions::new(None, None),
+        );
+
+        let df = lf.unwrap().collect().unwrap();
+
+        println!("{:?}", df);
+
+        collection.clone().drop().run().unwrap();
+        let final_check = collection.clone().find(doc! {}).run().unwrap();
+        assert!(final_check.collect::<Vec<_>>().is_empty());
+    }
+}

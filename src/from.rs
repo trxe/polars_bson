@@ -76,7 +76,8 @@ impl<'a> From<Bson> for Wrap<AnyValue<'a>> {
             Bson::Array(arr) => {
                 let vals: Vec<Wrap<AnyValue>> = arr.iter().map(|v| v.into()).collect();
                 // Wrap is transparent, so this is safe
-                let vals = unsafe { std::mem::transmute::<_, Vec<AnyValue>>(vals) };
+                let vals =
+                    unsafe { std::mem::transmute::<Vec<Wrap<AnyValue>>, Vec<AnyValue>>(vals) };
                 let s = Series::new("".into(), vals);
                 AnyValue::List(s)
             }
@@ -108,7 +109,8 @@ impl<'a, 'b> From<&'b Bson> for Wrap<AnyValue<'a>> {
             Bson::Array(arr) => {
                 let vals: Vec<Wrap<AnyValue>> = arr.iter().map(|v| v.into()).collect();
                 // Wrap is transparent, so this is safe
-                let vals = unsafe { std::mem::transmute::<_, Vec<AnyValue>>(vals) };
+                let vals =
+                    unsafe { std::mem::transmute::<Vec<Wrap<AnyValue>>, Vec<AnyValue>>(vals) };
                 let s = Series::new("".into(), vals);
                 AnyValue::List(s)
             }

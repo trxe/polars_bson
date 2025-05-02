@@ -11,8 +11,9 @@ use polars_time::prelude::string::infer::{
 };
 
 use crate::common::{SyncCursor, is_whitespace, skip_whitespace};
+use crate::from::Wrap;
 
-pub fn parse_lines<'a>(
+pub fn parse_lines(
     mut cursor: SyncCursor,
     buffers: &mut PlIndexMap<PlSmallStr, Buffer>,
     ignore_errors: bool,
@@ -22,9 +23,12 @@ pub fn parse_lines<'a>(
     while let Some(Ok(doc)) = cursor.next() {
         buffers.iter_mut().for_each(|(s, inner)| match doc.get(s) {
             Some(v) => {
-                let bts = v.to_string().bytes().collect::<Vec<u8>>();
+                // TODO: make this use the wrap, with serde
+                let wrapped_val: Wrap<AnyValue> = v.into();
+                let str_val = wrapped_val.0.to_string();
+                let bts = str_val.as_bytes();
                 inner
-                    .add(bts.as_slice(), ignore_errors, needs_escaping, !allow_null)
+                    .add(bts, ignore_errors, needs_escaping, !allow_null)
                     .expect("unable to parse")
             }
             None => inner.add_null(allow_null),
@@ -358,20 +362,12 @@ impl CategoricalField {
                 // SAFETY:
                 // just did utf8 check
                 let key = unsafe { std::str::from_utf8_unchecked(&self.escape_scratch) };
-                if self.is_enum {
-                    self.builder.append_value(key);
-                } else {
-                    self.builder.append_value(key);
-                }
+                self.builder.append_value(key);
             } else {
                 // SAFETY:
                 // just did utf8 check
                 let key = unsafe { std::str::from_utf8_unchecked(bytes) };
-                if self.is_enum {
-                    self.builder.append_value(key)
-                } else {
-                    self.builder.append_value(key)
-                }
+                self.builder.append_value(key)
             }
         } else if ignore_errors {
             self.builder.append_null()
@@ -605,8 +601,10 @@ pub fn init_buffers(
                     }
                     Buffer::Categorical(CategoricalField::new_enum(quote_char, builder))
                 }
+                DataType::Struct(_) => Buffer::Utf8(Utf8Field::new(name, capacity, quote_char, encoding)),
+                DataType::List(_) => Buffer::Utf8(Utf8Field::new(name, capacity, quote_char, encoding)),
                 dt => polars_bail!(
-                    ComputeError: "unsupported data type when reading CSV: {} when reading CSV", dt,
+                    ComputeError: "unsupported data type when reading Bson: {} when reading Bson", dt,
                 ),
             };
             Ok((PlSmallStr::from_str(colname), builder))

@@ -4,13 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+chrono = "0.4.41"
 polars-time = "0.46.0"
 polars-core = "0.46.0"
-bson = "2.14.0"
+bson = { version = "2.14.0", features = ["chrono-0_4"] }
 mongodb = { version = "3.2.3", features = ["sync"] }
 atoi_simd = "0.16.0"
 simdutf8 = "0.1.5"
 fast-float2 = "0.2.3"
+
+[dev-dependencies]
+dotenvy = "0.15.7"
 
 [dependencies.polars]
 version = "0.46.0"
