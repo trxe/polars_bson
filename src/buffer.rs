@@ -609,7 +609,7 @@ pub fn init_buffers(
                     ComputeError: "unsupported data type when reading CSV: {} when reading CSV", dt,
                 ),
             };
-            Ok((PlSmallStr::from_str(&colname), builder))
+            Ok((PlSmallStr::from_str(colname), builder))
         })
         .collect()
 }

@@ -84,7 +84,7 @@ impl<'a> From<Bson> for Wrap<AnyValue<'a>> {
             Bson::Null | Bson::Undefined => AnyValue::Null,
             Bson::Int32(v) => AnyValue::Int32(v),
             Bson::Int64(v) => AnyValue::Int64(v),
-            Bson::Timestamp(v) => AnyValue::StringOwned(format!("{:#?}", v).into()),
+            Bson::Timestamp(v) => AnyValue::StringOwned(format!("{v:#?}").into()),
             Bson::DateTime(dt) => {
                 AnyValue::Datetime(dt.timestamp_millis(), TimeUnit::Milliseconds, None)
             }
@@ -94,7 +94,7 @@ impl<'a> From<Bson> for Wrap<AnyValue<'a>> {
             }
             Bson::ObjectId(oid) => AnyValue::StringOwned(oid.to_string().into()),
             Bson::Symbol(s) => AnyValue::StringOwned(s.into()),
-            v => AnyValue::StringOwned(format!("{:#?}", v).into()),
+            v => AnyValue::StringOwned(format!("{v:#?}").into()),
         };
         Wrap(dt)
     }
@@ -141,7 +141,7 @@ impl<'a, 'b> From<&'b Bson> for Wrap<AnyValue<'a>> {
             }
             Bson::ObjectId(oid) => AnyValue::StringOwned(oid.to_string().into()),
             Bson::Symbol(s) => AnyValue::StringOwned(s.to_string().into()),
-            v => AnyValue::StringOwned(format!("{:#?}", v).into()),
+            v => AnyValue::StringOwned(format!("{v:#?}").into()),
         };
         Wrap(dt)
     }

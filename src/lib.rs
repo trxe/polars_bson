@@ -1,22 +1,19 @@
 pub mod buffer;
 pub mod common;
 pub mod from;
-use std::{error::Error, ops::Deref, sync::Arc};
+use std::sync::Arc;
 
-use bson::doc;
 use buffer::{init_buffers, parse_lines};
 use common::{BsonDoc, SyncCursor};
 use from::Wrap;
-use mongodb::{Cursor, action::Find, sync::Collection};
+use mongodb::{action::Find, sync::Collection};
 use polars::{
     error::{ErrString, PolarsError, PolarsResult},
     frame::row::infer_schema,
     prelude::{
-        AnonymousScan, Column, DataFrame, DataType, DateType, LazyFrame, ScanArgsAnonymous, Schema,
-        SchemaRef,
+        AnonymousScan, Column, DataFrame, DataType, LazyFrame, ScanArgsAnonymous, Schema, SchemaRef,
     },
 };
-use polars_core::POOL;
 
 pub struct BsonScan {
     pub collection: Collection<BsonDoc>,
@@ -47,7 +44,7 @@ impl BsonScan {
         Self {
             collection,
             find_doc,
-            infer_schema_length: options.infer_schema_length.clone(),
+            infer_schema_length: options.infer_schema_length,
             n_threads: None,
             ignore_errors: Some(false),
             needs_escaping: Some(false),
@@ -55,7 +52,7 @@ impl BsonScan {
         }
     }
     fn get_cursor(&self) -> PolarsResult<SyncCursor> {
-        let find_doc = self.find_doc.clone().unwrap_or(doc! {});
+        let find_doc = self.find_doc.clone().unwrap_or_default();
         let find: Find<BsonDoc> = self.collection.find(find_doc);
         let cursor = match find.run() {
             Ok(x) => x,
@@ -94,7 +91,7 @@ impl BsonScan {
         let mut buffers = init_buffers(
             rows_per_thread,
             schema.as_ref(),
-            Some('\'' as u8),
+            Some(b'\''),
             polars::prelude::CsvEncoding::Utf8,
             false,
         )?;

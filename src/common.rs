@@ -1,5 +1,3 @@
-use polars::prelude::PlIndexMap;
-
 pub type BsonDoc = bson::Document;
 pub type SyncCursor = mongodb::sync::Cursor<BsonDoc>;
 
@@ -12,7 +10,7 @@ pub enum ScanStrategy {
 }
 
 pub fn is_whitespace(the_char: u8) -> bool {
-    the_char == ' ' as u8
+    the_char == b' '
 }
 
 pub fn skip_whitespace(bytes: &[u8]) -> &[u8] {
