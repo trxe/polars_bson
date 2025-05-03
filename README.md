@@ -5,6 +5,9 @@ Still a work in progress, will be slowly implementing:
 1. Either streaming or SIMD to improve performance
 1. Using options for controlling `infer_schema_len`, `n_threads` etc.
 
+> WARNING: The interface for `BsonReader` is still WIP as well. 
+> Subject to changes in architecture.
+
 ## Sample Usage
 
 ```rs
