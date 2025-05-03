@@ -1,928 +1,343 @@
-use std::mem::MaybeUninit;
+use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
 
-use polars::error::to_compute_err;
-use polars::prelude::CsvEncoding;
-use polars_core::prelude::*;
-use polars_core::utils::arrow::array::MutableBinaryViewArray;
-use polars_core::utils::arrow::legacy::trusted_len::TrustedLenPush;
-use polars_time::chunkedarray::string::Pattern;
-use polars_time::prelude::string::infer::{
-    DatetimeInfer, StrpTimeParser, TryFromWithUnit, infer_pattern_single,
+use bson::{Bson, DateTime};
+use polars::{
+    error::{PolarsError, PolarsResult, polars_bail, polars_err},
+    frame::row::AnyValueBuffer,
+    prelude::{
+        AnyValue, ArrowDataType, ChunkedBuilder, CompatLevel, DataType, DateType, Field,
+        PlIndexMap, PlSmallStr, PolarsNumericType, Schema, TimeUnit, dtype_col,
+    },
+    series::Series,
+};
+use polars_core::utils::{arrow::array::StructArray, dtypes_to_supertype};
+use polars_time::prelude::string::infer::{DatetimeInfer, TryFromWithUnit};
+
+use crate::{
+    common::BsonDoc,
+    from::{Wrap, coerce_dtype_arrow},
 };
 
-use crate::common::{SyncCursor, is_whitespace, skip_whitespace};
-use crate::from::Wrap;
-
-pub fn parse_lines(
-    mut cursor: SyncCursor,
-    buffers: &mut PlIndexMap<PlSmallStr, Buffer>,
-    ignore_errors: bool,
-    needs_escaping: bool,
-    allow_null: bool,
-) -> mongodb::error::Result<()> {
-    while let Some(Ok(doc)) = cursor.next() {
-        buffers.iter_mut().for_each(|(s, inner)| match doc.get(s) {
-            Some(v) => {
-                // TODO: make this use the wrap, with serde
-                let wrapped_val: Wrap<AnyValue> = v.into();
-                let str_val = wrapped_val.0.to_string();
-                let bts = str_val.as_bytes();
-                inner
-                    .add(bts, ignore_errors, needs_escaping, !allow_null)
-                    .expect("unable to parse")
-            }
-            None => inner.add_null(allow_null),
-        });
+/// Infers the [`ArrowDataType`] from an NDJSON file, optionally only using `number_of_rows` rows.
+///
+/// # Implementation
+/// This implementation reads the file line by line and infers the type of each line.
+/// It performs both `O(N)` IO and CPU-bounded operations where `N` is the number of rows.
+pub fn iter_unique_dtypes(
+    documents: &[BsonDoc],
+    number_of_rows: Option<usize>,
+) -> PolarsResult<impl Iterator<Item = ArrowDataType>> {
+    if documents.is_empty() {
+        return Err(PolarsError::ComputeError(
+            "No results found in returned Bson document array".into(),
+        ));
     }
-    Ok(())
-}
-
-fn escape_field(bytes: &[u8], quote: u8, buf: &mut [MaybeUninit<u8>]) -> usize {
-    debug_assert!(bytes.len() > 1);
-    let mut prev_quote = false;
-
-    let mut count = 0;
-    for c in unsafe { bytes.get_unchecked(1..bytes.len() - 1) } {
-        if *c == quote {
-            if prev_quote {
-                prev_quote = false;
-                unsafe { buf.get_unchecked_mut(count).write(*c) };
-                count += 1;
-            } else {
-                prev_quote = true;
-            }
-        } else {
-            prev_quote = false;
-            unsafe { buf.get_unchecked_mut(count).write(*c) };
-            count += 1;
+    let doc_len = documents.len();
+    let mut dtypes: Vec<Wrap<ArrowDataType>> = vec![];
+    for row in 0..number_of_rows.unwrap_or(doc_len) {
+        if row > doc_len {
+            break;
         }
-    }
-    count
-}
-pub(crate) trait PrimitiveParser: PolarsNumericType {
-    fn parse(bytes: &[u8]) -> Option<Self::Native>;
-}
-
-impl PrimitiveParser for Float32Type {
-    #[inline]
-    fn parse(bytes: &[u8]) -> Option<f32> {
-        fast_float2::parse(bytes).ok()
-    }
-}
-impl PrimitiveParser for Float64Type {
-    #[inline]
-    fn parse(bytes: &[u8]) -> Option<f64> {
-        fast_float2::parse(bytes).ok()
-    }
-}
-
-impl PrimitiveParser for UInt8Type {
-    #[inline]
-    fn parse(bytes: &[u8]) -> Option<u8> {
-        atoi_simd::parse_skipped(bytes).ok()
-    }
-}
-impl PrimitiveParser for UInt16Type {
-    #[inline]
-    fn parse(bytes: &[u8]) -> Option<u16> {
-        atoi_simd::parse_skipped(bytes).ok()
-    }
-}
-impl PrimitiveParser for UInt32Type {
-    #[inline]
-    fn parse(bytes: &[u8]) -> Option<u32> {
-        atoi_simd::parse_skipped(bytes).ok()
-    }
-}
-impl PrimitiveParser for UInt64Type {
-    #[inline]
-    fn parse(bytes: &[u8]) -> Option<u64> {
-        atoi_simd::parse_skipped(bytes).ok()
-    }
-}
-impl PrimitiveParser for Int8Type {
-    #[inline]
-    fn parse(bytes: &[u8]) -> Option<i8> {
-        atoi_simd::parse_skipped(bytes).ok()
-    }
-}
-impl PrimitiveParser for Int16Type {
-    #[inline]
-    fn parse(bytes: &[u8]) -> Option<i16> {
-        atoi_simd::parse_skipped(bytes).ok()
-    }
-}
-impl PrimitiveParser for Int32Type {
-    #[inline]
-    fn parse(bytes: &[u8]) -> Option<i32> {
-        atoi_simd::parse_skipped(bytes).ok()
-    }
-}
-impl PrimitiveParser for Int64Type {
-    #[inline]
-    fn parse(bytes: &[u8]) -> Option<i64> {
-        atoi_simd::parse_skipped(bytes).ok()
-    }
-}
-impl PrimitiveParser for Int128Type {
-    #[inline]
-    fn parse(bytes: &[u8]) -> Option<i128> {
-        atoi_simd::parse_skipped(bytes).ok()
-    }
-}
-
-trait ParsedBuffer {
-    fn parse_bytes(
-        &mut self,
-        bytes: &[u8],
-        ignore_errors: bool,
-        _needs_escaping: bool,
-        _missing_is_null: bool,
-        _time_unit: Option<TimeUnit>,
-    ) -> PolarsResult<()>;
-}
-
-impl<T> ParsedBuffer for PrimitiveChunkedBuilder<T>
-where
-    T: PolarsNumericType + PrimitiveParser,
-{
-    #[inline]
-    fn parse_bytes(
-        &mut self,
-        bytes: &[u8],
-        ignore_errors: bool,
-        needs_escaping: bool,
-        _missing_is_null: bool,
-        _time_unit: Option<TimeUnit>,
-    ) -> PolarsResult<()> {
-        if bytes.is_empty() {
-            self.append_null()
-        } else {
-            let bytes = if needs_escaping {
-                &bytes[1..bytes.len() - 1]
-            } else {
-                bytes
-            };
-
-            // legacy comment (remember this if you decide to use Results again):
-            // its faster to work on options.
-            // if we need to throw an error, we parse again to be able to throw the error
-
-            match T::parse(bytes) {
-                Some(value) => self.append_value(value),
-                None => {
-                    // try again without whitespace
-                    if !bytes.is_empty() && is_whitespace(bytes[0]) {
-                        let bytes = skip_whitespace(bytes);
-                        return self.parse_bytes(
-                            bytes,
-                            ignore_errors,
-                            false, // escaping was already done
-                            _missing_is_null,
-                            None,
-                        );
-                    }
-                    polars_ensure!(
-                        bytes.is_empty() || ignore_errors,
-                        ComputeError: "remaining bytes non-empty",
-                    );
-                    self.append_null()
-                }
-            };
-        }
-        Ok(())
-    }
-}
-
-pub struct Utf8Field {
-    name: PlSmallStr,
-    mutable: MutableBinaryViewArray<[u8]>,
-    scratch: Vec<u8>,
-    quote_char: u8,
-    encoding: CsvEncoding,
-}
-
-impl Utf8Field {
-    fn new(
-        name: PlSmallStr,
-        capacity: usize,
-        quote_char: Option<u8>,
-        encoding: CsvEncoding,
-    ) -> Self {
-        Self {
-            name,
-            mutable: MutableBinaryViewArray::with_capacity(capacity),
-            scratch: vec![],
-            quote_char: quote_char.unwrap_or(b'"'),
-            encoding,
-        }
-    }
-}
-
-#[inline]
-pub fn validate_utf8(bytes: &[u8]) -> bool {
-    simdutf8::basic::from_utf8(bytes).is_ok()
-}
-
-impl ParsedBuffer for Utf8Field {
-    #[inline]
-    fn parse_bytes(
-        &mut self,
-        bytes: &[u8],
-        ignore_errors: bool,
-        needs_escaping: bool,
-        missing_is_null: bool,
-        _time_unit: Option<TimeUnit>,
-    ) -> PolarsResult<()> {
-        if bytes.is_empty() {
-            if missing_is_null {
-                self.mutable.push_null()
-            } else {
-                self.mutable.push(Some([]))
-            }
-            return Ok(());
-        }
-
-        // note that one branch writes without updating the length, so we must do that later.
-        let escaped_bytes = if needs_escaping {
-            self.scratch.clear();
-            self.scratch.reserve(bytes.len());
-            polars_ensure!(bytes.len() > 1 && bytes.last() == Some(&self.quote_char), ComputeError: "invalid csv file\n\nField `{}` is not properly escaped.", std::str::from_utf8(bytes).map_err(to_compute_err)?);
-
-            // SAFETY:
-            // we just allocated enough capacity and data_len is correct.
-            unsafe {
-                let n_written =
-                    escape_field(bytes, self.quote_char, self.scratch.spare_capacity_mut());
-                self.scratch.set_len(n_written);
-            }
-
-            self.scratch.as_slice()
-        } else {
-            bytes
+        match documents.get(row) {
+            Some(doc) => dtypes.push(doc.into()),
+            None => break,
         };
+    }
 
-        if matches!(self.encoding, CsvEncoding::LossyUtf8) | ignore_errors {
-            // It is important that this happens after escaping, as invalid escaped string can produce
-            // invalid utf8.
-            let parse_result = validate_utf8(escaped_bytes);
+    Ok(dtypes.into_iter().map(|x| x.0))
+}
 
-            match parse_result {
-                true => {
-                    let value = escaped_bytes;
-                    self.mutable.push_value(value)
-                }
-                false => {
-                    if matches!(self.encoding, CsvEncoding::LossyUtf8) {
-                        // TODO! do this without allocating
-                        let s = String::from_utf8_lossy(escaped_bytes);
-                        self.mutable.push_value(s.as_ref().as_bytes())
-                    } else if ignore_errors {
-                        self.mutable.push_null()
-                    } else {
-                        // If field before escaping is valid utf8, the escaping is incorrect.
-                        if needs_escaping && validate_utf8(bytes) {
-                            polars_bail!(ComputeError: "string field is not properly escaped");
-                        } else {
-                            polars_bail!(ComputeError: "invalid utf-8 sequence");
-                        }
-                    }
-                }
-            }
+pub fn infer_schema(documents: &[BsonDoc], infer_schema_len: i64) -> PolarsResult<Schema> {
+    let arrow_dtypes = iter_unique_dtypes(
+        documents,
+        if infer_schema_len < 0 {
+            None
         } else {
-            self.mutable.push_value(escaped_bytes)
-        }
-
-        Ok(())
-    }
-}
-
-pub struct CategoricalField {
-    escape_scratch: Vec<u8>,
-    quote_char: u8,
-    builder: CategoricalChunkedBuilder,
-    is_enum: bool,
-}
-
-impl CategoricalField {
-    fn new(
-        name: PlSmallStr,
-        capacity: usize,
-        quote_char: Option<u8>,
-        ordering: CategoricalOrdering,
-    ) -> Self {
-        let builder = CategoricalChunkedBuilder::new(name, capacity, ordering);
-
-        Self {
-            escape_scratch: vec![],
-            quote_char: quote_char.unwrap_or(b'"'),
-            builder,
-            is_enum: false,
-        }
-    }
-
-    fn new_enum(quote_char: Option<u8>, builder: CategoricalChunkedBuilder) -> Self {
-        Self {
-            escape_scratch: vec![],
-            quote_char: quote_char.unwrap_or(b'"'),
-            builder,
-            is_enum: true,
-        }
-    }
-
-    #[inline]
-    fn parse_bytes(
-        &mut self,
-        bytes: &[u8],
-        ignore_errors: bool,
-        needs_escaping: bool,
-        _missing_is_null: bool,
-        _time_unit: Option<TimeUnit>,
-    ) -> PolarsResult<()> {
-        if bytes.is_empty() {
-            self.builder.append_null();
-            return Ok(());
-        }
-        if validate_utf8(bytes) {
-            if needs_escaping {
-                polars_ensure!(bytes.len() > 1, ComputeError: "invalid csv file\n\nField `{}` is not properly escaped.", std::str::from_utf8(bytes).map_err(to_compute_err)?);
-                self.escape_scratch.clear();
-                self.escape_scratch.reserve(bytes.len());
-                // SAFETY:
-                // we just allocated enough capacity and data_len is correct.
-                unsafe {
-                    let n_written = escape_field(
-                        bytes,
-                        self.quote_char,
-                        self.escape_scratch.spare_capacity_mut(),
-                    );
-                    self.escape_scratch.set_len(n_written);
-                }
-
-                // SAFETY:
-                // just did utf8 check
-                let key = unsafe { std::str::from_utf8_unchecked(&self.escape_scratch) };
-                self.builder.append_value(key);
-            } else {
-                // SAFETY:
-                // just did utf8 check
-                let key = unsafe { std::str::from_utf8_unchecked(bytes) };
-                self.builder.append_value(key)
-            }
-        } else if ignore_errors {
-            self.builder.append_null()
-        } else {
-            polars_bail!(ComputeError: "invalid utf-8 sequence");
-        }
-        Ok(())
-    }
-}
-
-impl ParsedBuffer for BooleanChunkedBuilder {
-    #[inline]
-    fn parse_bytes(
-        &mut self,
-        bytes: &[u8],
-        ignore_errors: bool,
-        needs_escaping: bool,
-        _missing_is_null: bool,
-        _time_unit: Option<TimeUnit>,
-    ) -> PolarsResult<()> {
-        let bytes = if needs_escaping {
-            &bytes[1..bytes.len() - 1]
-        } else {
-            bytes
-        };
-        if bytes.eq_ignore_ascii_case(b"false") {
-            self.append_value(false);
-        } else if bytes.eq_ignore_ascii_case(b"true") {
-            self.append_value(true);
-        } else if ignore_errors || bytes.is_empty() {
-            self.append_null();
-        } else {
-            polars_bail!(
-                ComputeError: "error while parsing value {} as boolean",
-                String::from_utf8_lossy(bytes),
-            );
-        }
-        Ok(())
-    }
-}
-
-pub struct DatetimeField<T: PolarsNumericType> {
-    compiled: Option<DatetimeInfer<T>>,
-    builder: PrimitiveChunkedBuilder<T>,
-}
-
-impl<T: PolarsNumericType> DatetimeField<T> {
-    fn new(name: PlSmallStr, capacity: usize) -> Self {
-        let builder = PrimitiveChunkedBuilder::<T>::new(name, capacity);
-        Self {
-            compiled: None,
-            builder,
-        }
-    }
-}
-
-fn slow_datetime_parser<T>(
-    buf: &mut DatetimeField<T>,
-    bytes: &[u8],
-    time_unit: Option<TimeUnit>,
-    ignore_errors: bool,
-) -> PolarsResult<()>
-where
-    T: PolarsNumericType,
-    DatetimeInfer<T>: TryFromWithUnit<Pattern>,
-{
-    let val = if bytes.is_ascii() {
-        // SAFETY:
-        // we just checked it is ascii
-        unsafe { std::str::from_utf8_unchecked(bytes) }
-    } else {
-        match std::str::from_utf8(bytes) {
-            Ok(val) => val,
-            Err(_) => {
-                if ignore_errors {
-                    buf.builder.append_null();
-                    return Ok(());
-                } else {
-                    polars_bail!(ComputeError: "invalid utf-8 sequence");
-                }
-            }
-        }
-    };
-
-    let pattern = match &buf.compiled {
-        Some(compiled) => compiled.pattern,
-        None => match infer_pattern_single(val) {
-            Some(pattern) => pattern,
-            None => {
-                if ignore_errors {
-                    buf.builder.append_null();
-                    return Ok(());
-                } else {
-                    polars_bail!(ComputeError: "could not find a 'date/datetime' pattern for '{}'", val)
-                }
-            }
+            Some(infer_schema_len as usize)
         },
-    };
-    match DatetimeInfer::try_from_with_unit(pattern, time_unit) {
-        Ok(mut infer) => {
-            let parsed = infer.parse(val);
-            let Some(parsed) = parsed else {
-                if ignore_errors {
-                    buf.builder.append_null();
-                    return Ok(());
-                } else {
-                    polars_bail!(ComputeError: "could not parse '{}' with pattern '{:?}'", val, pattern)
-                }
-            };
+    )?;
+    let allow_dtypes = arrow_dtypes
+        .map(|dt| DataType::from_arrow_dtype(&dt))
+        .collect::<Vec<_>>();
+    let dtype = dtypes_to_supertype(allow_dtypes.iter())?;
+    let schema = StructArray::get_fields(&dtype.to_arrow(CompatLevel::newest()))
+        .iter()
+        .map(Into::<Field>::into)
+        .collect();
+    Ok(schema)
+}
 
-            buf.compiled = Some(infer);
-            buf.builder.append_value(parsed);
-            Ok(())
-        }
-        Err(err) => {
-            if ignore_errors {
-                buf.builder.append_null();
+pub struct DataBuffer<'a> {
+    name: &'a str,
+    ignore_errors: bool,
+    buf: AnyValueBuffer<'a>,
+}
+
+impl DataBuffer<'_> {
+    pub fn into_series(self) -> PolarsResult<Series> {
+        let mut buf = self.buf;
+        let mut s = buf.reset(0);
+        s.rename(PlSmallStr::from_str(self.name));
+        Ok(s)
+    }
+
+    #[inline]
+    pub fn add(&mut self, bson: &Bson) -> PolarsResult<()> {
+        use AnyValueBuffer::*;
+        match &mut self.buf {
+            Boolean(buf) => {
+                match bson.as_bool() {
+                    Some(val) => buf.append_value(val),
+                    None => buf.append_null(),
+                }
                 Ok(())
-            } else {
-                Err(err)
             }
+            Int32(buf) => {
+                match bson.as_i32() {
+                    Some(val) => buf.append_value(val),
+                    None => buf.append_null(),
+                }
+                Ok(())
+            }
+            Int64(buf) => {
+                match bson.as_i64() {
+                    Some(val) => buf.append_value(val),
+                    None => buf.append_null(),
+                }
+                Ok(())
+            }
+            UInt64(buf) => {
+                match bson.as_i64() {
+                    Some(val) => buf.append_value(val as u64),
+                    None => buf.append_null(),
+                }
+                Ok(())
+            }
+            UInt32(buf) => {
+                match bson.as_i64() {
+                    Some(val) => buf.append_value(val as u32),
+                    None => buf.append_null(),
+                }
+                Ok(())
+            }
+            Float32(buf) => {
+                match bson.as_f64() {
+                    Some(val) => buf.append_value(val as f32),
+                    None => buf.append_null(),
+                }
+                Ok(())
+            }
+            Float64(buf) => {
+                match bson.as_f64() {
+                    Some(val) => buf.append_value(val),
+                    None => buf.append_null(),
+                }
+                Ok(())
+            }
+
+            String(buf) => {
+                match bson.as_str() {
+                    Some(val) => buf.append_value(val),
+                    None => buf.append_null(),
+                }
+                Ok(())
+            }
+            Datetime(buf, tu, _) => {
+                match bson.as_datetime() {
+                    Some(val) => buf.append_value(datetime_to_time_since_epoch(val, *tu)),
+                    None => buf.append_null(),
+                }
+                Ok(())
+            }
+            Date(buf) => {
+                match bson.as_datetime() {
+                    Some(val) => buf.append_value(datetime_to_days_since_epoch(val)),
+                    None => buf.append_null(),
+                }
+                Ok(())
+            }
+            All(dtype, buf) => {
+                let av = deserialize_all(bson, dtype, self.ignore_errors)?;
+                buf.push(av);
+                Ok(())
+            }
+            Null(builder) => {
+                match bson.as_null() {
+                    Some(()) => builder.append_null(),
+                    None => {
+                        polars_bail!(ComputeError: "got non-null value for NULL-typed column: {}", bson)
+                    }
+                }
+                Ok(())
+            }
+            _ => panic!("unexpected dtype when deserializing ndjson"),
         }
+    }
+
+    pub fn add_null(&mut self) {
+        self.buf.add(AnyValue::Null).expect("should not fail");
     }
 }
 
-impl<T> ParsedBuffer for DatetimeField<T>
-where
-    T: PolarsNumericType,
-    DatetimeInfer<T>: TryFromWithUnit<Pattern> + StrpTimeParser<T::Native>,
-{
-    #[inline]
-    fn parse_bytes(
-        &mut self,
-        mut bytes: &[u8],
-        ignore_errors: bool,
-        needs_escaping: bool,
-        _missing_is_null: bool,
-        time_unit: Option<TimeUnit>,
-    ) -> PolarsResult<()> {
-        if needs_escaping && bytes.len() >= 2 {
-            bytes = &bytes[1..bytes.len() - 1]
-        }
+const MS_PER_DAY: i64 = 1000 * 60 * 60 * 24;
 
-        if bytes.is_empty() {
-            // for types other than string `_missing_is_null` is irrelevant; we always append null
-            self.builder.append_null();
-            return Ok(());
-        }
+fn datetime_to_days_since_epoch(val: &DateTime) -> i32 {
+    let ms = val.timestamp_millis();
+    return (ms / MS_PER_DAY) as i32;
+}
 
-        match &mut self.compiled {
-            None => slow_datetime_parser(self, bytes, time_unit, ignore_errors),
-            Some(compiled) => {
-                match compiled.parse_bytes(bytes, time_unit) {
-                    Some(parsed) => {
-                        self.builder.append_value(parsed);
-                        Ok(())
-                    }
-                    // fall back on chrono parser
-                    // this is a lot slower, we need to do utf8 checking and use
-                    // the slower parser
-                    None => slow_datetime_parser(self, bytes, time_unit, ignore_errors),
+fn datetime_to_time_since_epoch(val: &DateTime, tu: TimeUnit) -> i64 {
+    let ms = val.timestamp_millis();
+    let div_factor = match tu {
+        TimeUnit::Milliseconds => 1,
+        TimeUnit::Microseconds => 1000,
+        TimeUnit::Nanoseconds => 1000000,
+    };
+    return ms * div_factor;
+}
+
+fn deserialize_all<'a>(
+    bson: &Bson,
+    dtype: &DataType,
+    ignore_errors: bool,
+) -> PolarsResult<AnyValue<'a>> {
+    if bson.as_null().is_some() {
+        return Ok(AnyValue::Null);
+    }
+    match dtype {
+        DataType::Date => {
+            return match bson.as_datetime() {
+                Some(val) => Ok(AnyValue::Date(datetime_to_days_since_epoch(val))),
+                None => Ok(AnyValue::Null),
+            };
+        }
+        DataType::Datetime(tu, tz) => {
+            return Ok(match bson.as_datetime() {
+                Some(val) => AnyValue::DatetimeOwned(
+                    datetime_to_time_since_epoch(val, *tu),
+                    *tu,
+                    tz.to_owned().map(|x| Arc::new(x)),
+                ),
+                None => AnyValue::Null,
+            });
+        }
+        DataType::Float32 => {
+            return Ok(match bson.as_f64() {
+                Some(val) => AnyValue::Float32(val as f32),
+                None => AnyValue::Null,
+            });
+        }
+        DataType::Float64 => {
+            return Ok(match bson.as_f64() {
+                Some(val) => AnyValue::Float64(val),
+                None => AnyValue::Null,
+            });
+        }
+        DataType::String => {
+            return Ok(match bson {
+                Bson::String(s) => AnyValue::StringOwned(s.into()),
+                v => AnyValue::StringOwned(v.to_string().into()),
+            });
+        }
+        dt if dt.is_primitive_numeric() => {
+            return Ok(match bson.as_i64() {
+                Some(val) => AnyValue::Int64(val),
+                None => AnyValue::Null,
+            });
+        }
+        _ => {}
+    }
+    let out = match bson {
+        Bson::Array(arr) => {
+            let Some(inner_dtype) = dtype.inner_dtype() else {
+                if ignore_errors {
+                    return Ok(AnyValue::Null);
                 }
+                polars_bail!(ComputeError: "expected dtype '{}' in Bson value, got dtype: Array\n\nEncountered value: {}", dtype, bson);
+            };
+            let vals: Vec<AnyValue> = arr
+                .iter()
+                .map(|val| deserialize_all(val, inner_dtype, ignore_errors))
+                .collect::<PolarsResult<_>>()?;
+            let strict = !ignore_errors;
+            let s =
+                Series::from_any_values_and_dtype(PlSmallStr::EMPTY, &vals, inner_dtype, strict)?;
+            AnyValue::List(s)
+        }
+        Bson::Document(doc) => {
+            if let DataType::Struct(fields) = dtype {
+                let vals = fields
+                    .iter()
+                    .map(|field| {
+                        if let Some(value) = doc.get(field.name.as_str()) {
+                            deserialize_all(value, &field.dtype, ignore_errors)
+                        } else {
+                            Ok(AnyValue::Null)
+                        }
+                    })
+                    .collect::<PolarsResult<Vec<_>>>()?;
+                AnyValue::StructOwned(Box::new((vals, fields.clone())))
+            } else {
+                if ignore_errors {
+                    return Ok(AnyValue::Null);
+                }
+                polars_bail!(
+                    ComputeError: "expected {} in json value, got object", dtype,
+                );
             }
         }
-    }
+        val => AnyValue::StringOwned(format!("{:#?}", val).into()),
+        // Value::Static(StaticNode::Bool(b)) => AnyValue::Boolean(*b),
+        // Value::Static(StaticNode::I64(i)) => AnyValue::Int64(*i),
+        // Value::Static(StaticNode::U64(u)) => AnyValue::UInt64(*u),
+        // Value::Static(StaticNode::F64(f)) => AnyValue::Float64(*f),
+        // Value::String(s) => AnyValue::StringOwned(s.as_ref().into()),
+    };
+
+    Ok(out)
 }
 
 pub fn init_buffers(
-    capacity: usize,
     schema: &Schema,
-    quote_char: Option<u8>,
-    encoding: CsvEncoding,
-    decimal_comma: bool,
-) -> PolarsResult<PlIndexMap<PlSmallStr, Buffer>> {
+    capacity: usize,
+    ignore_errors: bool,
+) -> PolarsResult<PlIndexMap<PlSmallStr, DataBuffer>> {
     schema
         .iter()
-        .map(|(colname, dtype)| {
-            let name = colname.to_owned();
-            let builder = match dtype {
-                DataType::Boolean => Buffer::Boolean(BooleanChunkedBuilder::new(name, capacity)),
-                DataType::Int8 => Buffer::Int8(PrimitiveChunkedBuilder::new(name, capacity)),
-                DataType::Int16 => Buffer::Int16(PrimitiveChunkedBuilder::new(name, capacity)),
-                DataType::Int32 => Buffer::Int32(PrimitiveChunkedBuilder::new(name, capacity)),
-                DataType::Int64 => Buffer::Int64(PrimitiveChunkedBuilder::new(name, capacity)),
-                DataType::Int128 => Buffer::Int128(PrimitiveChunkedBuilder::new(name, capacity)),
-                DataType::UInt8 => Buffer::UInt8(PrimitiveChunkedBuilder::new(name, capacity)),
-                DataType::UInt16 => Buffer::UInt16(PrimitiveChunkedBuilder::new(name, capacity)),
-                DataType::UInt32 => Buffer::UInt32(PrimitiveChunkedBuilder::new(name, capacity)),
-                DataType::UInt64 => Buffer::UInt64(PrimitiveChunkedBuilder::new(name, capacity)),
-                DataType::Float32 => {
-                    if decimal_comma {
-                        Buffer::DecimalFloat32(
-                            PrimitiveChunkedBuilder::new(name, capacity),
-                            Default::default(),
-                        )
-                    } else {
-                        Buffer::Float32(PrimitiveChunkedBuilder::new(name, capacity))
-                    }
-                }
-                DataType::Float64 => {
-                    if decimal_comma {
-                        Buffer::DecimalFloat64(
-                            PrimitiveChunkedBuilder::new(name, capacity),
-                            Default::default(),
-                        )
-                    } else {
-                        Buffer::Float64(PrimitiveChunkedBuilder::new(name, capacity))
-                    }
-                }
-                DataType::String => {
-                    Buffer::Utf8(Utf8Field::new(name, capacity, quote_char, encoding))
-                }
-                DataType::Datetime(time_unit, time_zone) => Buffer::Datetime {
-                    buf: DatetimeField::new(name, capacity),
-                    time_unit: *time_unit,
-                    time_zone: time_zone.clone(),
+        .map(|(name, dtype)| {
+            let av_buf = (dtype, capacity).into();
+            Ok((
+                name.to_owned(),
+                DataBuffer {
+                    name,
+                    buf: av_buf,
+                    ignore_errors,
                 },
-                DataType::Date => Buffer::Date(DatetimeField::new(name, capacity)),
-                DataType::Categorical(_, ordering) => Buffer::Categorical(CategoricalField::new(
-                    name, capacity, quote_char, *ordering,
-                )),
-                DataType::Enum(rev_map, _) => {
-                    let Some(rev_map) = rev_map else {
-                        polars_bail!(ComputeError: "enum categories must be set")
-                    };
-                    let cats = rev_map.get_categories();
-                    let mut builder =
-                        CategoricalChunkedBuilder::new(name, capacity, Default::default());
-                    for cat in cats.values_iter() {
-                        builder.register_value(cat);
-                    }
-                    Buffer::Categorical(CategoricalField::new_enum(quote_char, builder))
-                }
-                DataType::Struct(_) => Buffer::Utf8(Utf8Field::new(name, capacity, quote_char, encoding)),
-                DataType::List(_) => Buffer::Utf8(Utf8Field::new(name, capacity, quote_char, encoding)),
-                dt => polars_bail!(
-                    ComputeError: "unsupported data type when reading Bson: {} when reading Bson", dt,
-                ),
-            };
-            Ok((PlSmallStr::from_str(colname), builder))
+            ))
         })
         .collect()
 }
 
-#[allow(clippy::large_enum_variant)]
-pub enum Buffer {
-    Boolean(BooleanChunkedBuilder),
-    Int8(PrimitiveChunkedBuilder<Int8Type>),
-    Int16(PrimitiveChunkedBuilder<Int16Type>),
-    Int32(PrimitiveChunkedBuilder<Int32Type>),
-    Int64(PrimitiveChunkedBuilder<Int64Type>),
-    Int128(PrimitiveChunkedBuilder<Int128Type>),
-    UInt8(PrimitiveChunkedBuilder<UInt8Type>),
-    UInt16(PrimitiveChunkedBuilder<UInt16Type>),
-    UInt32(PrimitiveChunkedBuilder<UInt32Type>),
-    UInt64(PrimitiveChunkedBuilder<UInt64Type>),
-    Float32(PrimitiveChunkedBuilder<Float32Type>),
-    Float64(PrimitiveChunkedBuilder<Float64Type>),
-    /// Stores the Utf8 fields and the total string length seen for that column
-    Utf8(Utf8Field),
-    Datetime {
-        buf: DatetimeField<Int64Type>,
-        time_unit: TimeUnit,
-        time_zone: Option<TimeZone>,
-    },
-    Date(DatetimeField<Int32Type>),
-    #[allow(dead_code)]
-    Categorical(CategoricalField),
-    DecimalFloat32(PrimitiveChunkedBuilder<Float32Type>, Vec<u8>),
-    DecimalFloat64(PrimitiveChunkedBuilder<Float64Type>, Vec<u8>),
-}
-
-impl Buffer {
-    pub fn into_series(self) -> PolarsResult<Series> {
-        let s = match self {
-            Buffer::Boolean(v) => v.finish().into_series(),
-            Buffer::Int8(v) => v.finish().into_series(),
-            Buffer::Int16(v) => v.finish().into_series(),
-            Buffer::Int32(v) => v.finish().into_series(),
-            Buffer::Int64(v) => v.finish().into_series(),
-            Buffer::Int128(v) => v.finish().into_series(),
-            Buffer::UInt8(v) => v.finish().into_series(),
-            Buffer::UInt16(v) => v.finish().into_series(),
-            Buffer::UInt32(v) => v.finish().into_series(),
-            Buffer::UInt64(v) => v.finish().into_series(),
-            Buffer::Float32(v) => v.finish().into_series(),
-            Buffer::Float64(v) => v.finish().into_series(),
-            Buffer::DecimalFloat32(v, _) => v.finish().into_series(),
-            Buffer::DecimalFloat64(v, _) => v.finish().into_series(),
-            Buffer::Datetime {
-                buf,
-                time_unit,
-                time_zone,
-            } => buf
-                .builder
-                .finish()
-                .into_series()
-                .cast(&DataType::Datetime(time_unit, time_zone))
-                .unwrap(),
-            Buffer::Date(v) => v
-                .builder
-                .finish()
-                .into_series()
-                .cast(&DataType::Date)
-                .unwrap(),
-
-            Buffer::Utf8(v) => {
-                let arr = v.mutable.freeze();
-                StringChunked::with_chunk(v.name.clone(), unsafe { arr.to_utf8view_unchecked() })
-                    .into_series()
-            }
-            #[allow(unused_variables)]
-            Buffer::Categorical(buf) => {
-                let ca = buf.builder.finish();
-
-                if buf.is_enum {
-                    let DataType::Categorical(Some(rev_map), _) = ca.dtype() else {
-                        unreachable!()
-                    };
-                    let idx = ca.physical().clone();
-                    let dtype = DataType::Enum(Some(rev_map.clone()), Default::default());
-
-                    unsafe {
-                        CategoricalChunked::from_cats_and_dtype_unchecked(idx, dtype).into_series()
+pub fn parse_lines(
+    docs: Vec<BsonDoc>,
+    buffers: &mut PlIndexMap<PlSmallStr, DataBuffer>,
+    _ignore_errors: bool,
+    _needs_escaping: bool,
+    allow_null: bool,
+) -> PolarsResult<()> {
+    for doc in docs {
+        for (s, inner) in buffers.as_mut_slice() {
+            match doc.get(s) {
+                Some(v) => inner.add(v).expect("unable to parse"),
+                None => {
+                    if allow_null {
+                        inner.add_null();
+                    } else {
+                        return Err(polars_err!(ComputeError: "received null for key {}", s));
                     }
-                } else {
-                    ca.into_series()
                 }
             }
-        };
-        Ok(s)
-    }
-
-    pub fn add_null(&mut self, valid: bool) {
-        match self {
-            Buffer::Boolean(v) => v.append_null(),
-            Buffer::Int8(v) => v.append_null(),
-            Buffer::Int16(v) => v.append_null(),
-            Buffer::Int32(v) => v.append_null(),
-            Buffer::Int64(v) => v.append_null(),
-            Buffer::Int128(v) => v.append_null(),
-            Buffer::UInt8(v) => v.append_null(),
-            Buffer::UInt16(v) => v.append_null(),
-            Buffer::UInt32(v) => v.append_null(),
-            Buffer::UInt64(v) => v.append_null(),
-            Buffer::Float32(v) => v.append_null(),
-            Buffer::Float64(v) => v.append_null(),
-            Buffer::DecimalFloat32(v, _) => v.append_null(),
-            Buffer::DecimalFloat64(v, _) => v.append_null(),
-            Buffer::Utf8(v) => {
-                if valid {
-                    v.mutable.push_value("")
-                } else {
-                    v.mutable.push_null()
-                }
-            }
-            Buffer::Datetime { buf, .. } => buf.builder.append_null(),
-            Buffer::Date(v) => v.builder.append_null(),
-            Buffer::Categorical(cat_builder) => cat_builder.builder.append_null(),
-        };
-    }
-
-    pub fn dtype(&self) -> DataType {
-        match self {
-            Buffer::Boolean(_) => DataType::Boolean,
-            Buffer::Int8(_) => DataType::Int8,
-            Buffer::Int16(_) => DataType::Int16,
-            Buffer::Int32(_) => DataType::Int32,
-            Buffer::Int64(_) => DataType::Int64,
-            Buffer::Int128(_) => DataType::Int128,
-            Buffer::UInt8(_) => DataType::UInt8,
-            Buffer::UInt16(_) => DataType::UInt16,
-            Buffer::UInt32(_) => DataType::UInt32,
-            Buffer::UInt64(_) => DataType::UInt64,
-            Buffer::Float32(_) | Buffer::DecimalFloat32(_, _) => DataType::Float32,
-            Buffer::Float64(_) | Buffer::DecimalFloat64(_, _) => DataType::Float64,
-            Buffer::Utf8(_) => DataType::String,
-            Buffer::Datetime { time_unit, .. } => DataType::Datetime(*time_unit, None),
-            Buffer::Date(_) => DataType::Date,
-            Buffer::Categorical(_) => DataType::Categorical(None, Default::default()),
         }
     }
-
-    #[inline]
-    pub fn add(
-        &mut self,
-        bytes: &[u8],
-        ignore_errors: bool,
-        needs_escaping: bool,
-        missing_is_null: bool,
-    ) -> PolarsResult<()> {
-        use Buffer::*;
-        match self {
-            Boolean(buf) => <BooleanChunkedBuilder as ParsedBuffer>::parse_bytes(
-                buf,
-                bytes,
-                ignore_errors,
-                needs_escaping,
-                missing_is_null,
-                None,
-            ),
-            Int8(buf) => <PrimitiveChunkedBuilder<Int8Type> as ParsedBuffer>::parse_bytes(
-                buf,
-                bytes,
-                ignore_errors,
-                needs_escaping,
-                missing_is_null,
-                None,
-            ),
-            Int16(buf) => <PrimitiveChunkedBuilder<Int16Type> as ParsedBuffer>::parse_bytes(
-                buf,
-                bytes,
-                ignore_errors,
-                needs_escaping,
-                missing_is_null,
-                None,
-            ),
-            Int32(buf) => <PrimitiveChunkedBuilder<Int32Type> as ParsedBuffer>::parse_bytes(
-                buf,
-                bytes,
-                ignore_errors,
-                needs_escaping,
-                missing_is_null,
-                None,
-            ),
-            Int64(buf) => <PrimitiveChunkedBuilder<Int64Type> as ParsedBuffer>::parse_bytes(
-                buf,
-                bytes,
-                ignore_errors,
-                needs_escaping,
-                missing_is_null,
-                None,
-            ),
-            Int128(buf) => <PrimitiveChunkedBuilder<Int128Type> as ParsedBuffer>::parse_bytes(
-                buf,
-                bytes,
-                ignore_errors,
-                needs_escaping,
-                missing_is_null,
-                None,
-            ),
-            UInt8(buf) => <PrimitiveChunkedBuilder<UInt8Type> as ParsedBuffer>::parse_bytes(
-                buf,
-                bytes,
-                ignore_errors,
-                needs_escaping,
-                missing_is_null,
-                None,
-            ),
-            UInt16(buf) => <PrimitiveChunkedBuilder<UInt16Type> as ParsedBuffer>::parse_bytes(
-                buf,
-                bytes,
-                ignore_errors,
-                needs_escaping,
-                missing_is_null,
-                None,
-            ),
-            UInt32(buf) => <PrimitiveChunkedBuilder<UInt32Type> as ParsedBuffer>::parse_bytes(
-                buf,
-                bytes,
-                ignore_errors,
-                needs_escaping,
-                missing_is_null,
-                None,
-            ),
-            UInt64(buf) => <PrimitiveChunkedBuilder<UInt64Type> as ParsedBuffer>::parse_bytes(
-                buf,
-                bytes,
-                ignore_errors,
-                needs_escaping,
-                missing_is_null,
-                None,
-            ),
-            Float32(buf) => <PrimitiveChunkedBuilder<Float32Type> as ParsedBuffer>::parse_bytes(
-                buf,
-                bytes,
-                ignore_errors,
-                needs_escaping,
-                missing_is_null,
-                None,
-            ),
-            Float64(buf) => <PrimitiveChunkedBuilder<Float64Type> as ParsedBuffer>::parse_bytes(
-                buf,
-                bytes,
-                ignore_errors,
-                needs_escaping,
-                missing_is_null,
-                None,
-            ),
-            DecimalFloat32(buf, scratch) => {
-                prepare_decimal_comma(bytes, scratch);
-                <PrimitiveChunkedBuilder<Float32Type> as ParsedBuffer>::parse_bytes(
-                    buf,
-                    scratch,
-                    ignore_errors,
-                    needs_escaping,
-                    missing_is_null,
-                    None,
-                )
-            }
-            DecimalFloat64(buf, scratch) => {
-                prepare_decimal_comma(bytes, scratch);
-                <PrimitiveChunkedBuilder<Float64Type> as ParsedBuffer>::parse_bytes(
-                    buf,
-                    scratch,
-                    ignore_errors,
-                    needs_escaping,
-                    missing_is_null,
-                    None,
-                )
-            }
-            Utf8(buf) => <Utf8Field as ParsedBuffer>::parse_bytes(
-                buf,
-                bytes,
-                ignore_errors,
-                needs_escaping,
-                missing_is_null,
-                None,
-            ),
-            Datetime { buf, time_unit, .. } => {
-                <DatetimeField<Int64Type> as ParsedBuffer>::parse_bytes(
-                    buf,
-                    bytes,
-                    ignore_errors,
-                    needs_escaping,
-                    missing_is_null,
-                    Some(*time_unit),
-                )
-            }
-            Date(buf) => <DatetimeField<Int32Type> as ParsedBuffer>::parse_bytes(
-                buf,
-                bytes,
-                ignore_errors,
-                needs_escaping,
-                missing_is_null,
-                None,
-            ),
-            Categorical(buf) => {
-                buf.parse_bytes(bytes, ignore_errors, needs_escaping, missing_is_null, None)
-            }
-        }
-    }
-}
-
-#[inline]
-fn prepare_decimal_comma(bytes: &[u8], scratch: &mut Vec<u8>) {
-    scratch.clear();
-    scratch.reserve(bytes.len());
-
-    // SAFETY: we pre-allocated.
-    for &byte in bytes {
-        if byte == b',' {
-            unsafe { scratch.push_unchecked(b'.') }
-        } else {
-            unsafe { scratch.push_unchecked(byte) }
-        }
-    }
+    Ok(())
 }

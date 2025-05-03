@@ -1725,6 +1725,7 @@ dependencies = [
  "atoi_simd",
  "bytes",
  "chrono",
+ "chrono-tz",
  "fast-float2",
  "futures",
  "glob",
@@ -1760,6 +1761,7 @@ checksum = "e30603ca81e317b66b4caac683a8325a6a82ea0489685dc37e22ae03720def98"
 dependencies = [
  "ahash",
  "chrono",
+ "chrono-tz",
  "fallible-streaming-iterator",
  "hashbrown 0.15.3",
  "indexmap 2.9.0",
