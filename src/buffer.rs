@@ -1,21 +1,20 @@
-use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
+use std::sync::Arc;
 
-use bson::{Binary, Bson, DateTime};
+use bson::{Bson, DateTime};
 use polars::{
     error::{PolarsError, PolarsResult, polars_bail, polars_err},
     frame::row::AnyValueBuffer,
     prelude::{
-        AnyValue, ArrowDataType, ChunkedBuilder, CompatLevel, DataType, DateType, Field,
-        PlIndexMap, PlSmallStr, PolarsNumericType, Schema, TimeUnit, dtype_col,
+        AnyValue, ArrowDataType, ChunkedBuilder, CompatLevel, DataType, Field,
+        PlIndexMap, PlSmallStr, Schema, TimeUnit,
     },
     series::Series,
 };
 use polars_core::utils::{arrow::array::StructArray, dtypes_to_supertype};
-use polars_time::prelude::string::infer::{DatetimeInfer, TryFromWithUnit};
 
 use crate::{
     common::BsonDoc,
-    from::{Wrap, coerce_dtype_arrow},
+    from::Wrap,
 };
 
 /// Infers the [`ArrowDataType`] from an NDJSON file, optionally only using `number_of_rows` rows.
@@ -190,7 +189,7 @@ const MS_PER_DAY: i64 = 1000 * 60 * 60 * 24;
 
 fn datetime_to_days_since_epoch(val: &DateTime) -> i32 {
     let ms = val.timestamp_millis();
-    return (ms / MS_PER_DAY) as i32;
+    (ms / MS_PER_DAY) as i32
 }
 
 fn datetime_to_time_since_epoch(val: &DateTime, tu: TimeUnit) -> i64 {
@@ -200,7 +199,7 @@ fn datetime_to_time_since_epoch(val: &DateTime, tu: TimeUnit) -> i64 {
         TimeUnit::Microseconds => 1000,
         TimeUnit::Nanoseconds => 1000000,
     };
-    return ms * div_factor;
+    ms * div_factor
 }
 
 fn deserialize_all<'a>(
@@ -223,7 +222,7 @@ fn deserialize_all<'a>(
                 Some(val) => AnyValue::DatetimeOwned(
                     datetime_to_time_since_epoch(val, *tu),
                     *tu,
-                    tz.to_owned().map(|x| Arc::new(x)),
+                    tz.to_owned().map(Arc::new),
                 ),
                 None => AnyValue::Null,
             });
@@ -294,7 +293,7 @@ fn deserialize_all<'a>(
                 );
             }
         }
-        val => AnyValue::StringOwned(format!("{:#?}", val).into()),
+        val => AnyValue::StringOwned(format!("{val:#?}").into()),
     };
 
     Ok(out)

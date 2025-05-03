@@ -2,16 +2,16 @@ pub mod buffer;
 pub mod common;
 pub mod from;
 
-use std::{num::NonZeroUsize, path::PathBuf, sync::Arc};
+use std::{num::NonZeroUsize, sync::Arc};
 
 use buffer::{infer_schema, init_buffers, parse_lines};
-use common::{BsonDoc, SyncCursor};
-use mongodb::{Cursor, sync::Collection};
+use common::BsonDoc;
+use mongodb::sync::Collection;
 use polars::{
     error::{PolarsError, PolarsResult},
     frame::DataFrame,
-    io::{RowIndex, SerReader, mmap::MmapBytesReader, predicates::PhysicalIoExpr},
-    prelude::{ArrayCollectIterExt, ArrowDataType, Column, PlSmallStr, Schema, SchemaRef},
+    io::{RowIndex, predicates::PhysicalIoExpr},
+    prelude::{Column, PlSmallStr, Schema, SchemaRef},
 };
 
 pub struct BsonScan {
@@ -23,8 +23,6 @@ pub struct BsonScan {
     pub needs_escaping: Option<bool>,
     pub allow_null: Option<bool>,
 }
-
-const DEFAULT_CHUNK_SIZE: usize = 100;
 
 pub struct BsonReader<'a> {
     collection: mongodb::sync::Collection<BsonDoc>,
@@ -62,7 +60,7 @@ impl<'a> BsonReader<'a> {
     }
 
     pub fn finish(self) -> PolarsResult<DataFrame> {
-        let mut cursor = match self.collection.find(self.find.clone()).run() {
+        let cursor = match self.collection.find(self.find.clone()).run() {
             Ok(x) => x,
             Err(e) => {
                 return Err(PolarsError::IO {
@@ -73,20 +71,17 @@ impl<'a> BsonReader<'a> {
         };
         let infer_len = self.infer_schema_len.unwrap_or(-1);
         let mut rows = vec![];
-        loop {
-            match cursor.next() {
-                Some(result) => match result {
-                    Ok(doc) => {
-                        rows.push(doc);
-                    }
-                    Err(e) => {
-                        return Err(PolarsError::IO {
-                            error: Arc::new(MongoError(e).into()),
-                            msg: Some("failed to extract bson document".into()),
-                        });
-                    }
-                },
-                None => break,
+        for result in cursor {
+            match result {
+                Ok(doc) => {
+                    rows.push(doc);
+                }
+                Err(e) => {
+                    return Err(PolarsError::IO {
+                        error: Arc::new(MongoError(e).into()),
+                        msg: Some("failed to extract bson document".into()),
+                    });
+                }
             }
         }
         let capacity = rows.len();
@@ -181,7 +176,6 @@ mod tests {
 
     use bson::doc;
     use chrono::Utc;
-    use polars::prelude::LazyFrame;
 
     use crate::{BsonReader, common::BsonDoc};
 
@@ -193,7 +187,7 @@ mod tests {
         let modb = match std::env::var("MONGO_LIVEDB") {
             Ok(x) => x,
             Err(_) => {
-                return ();
+                return;
             }
         };
         let client = mongodb::sync::Client::with_uri_str(modb).expect("client not built");
@@ -203,7 +197,7 @@ mod tests {
             .finish()
             .unwrap();
 
-        println!("{:?}", df);
+        println!("{df:?}");
     }
 
     #[test]
@@ -224,7 +218,7 @@ mod tests {
             .finish()
             .unwrap();
 
-        println!("{:?}", df);
+        println!("{df:?}");
 
         collection.clone().drop().run().unwrap();
         let final_check = collection.clone().find(doc! {}).run().unwrap();

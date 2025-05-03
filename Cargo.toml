@@ -2,6 +2,16 @@
 name = "polars_bson"
 version = "0.1.0"
 edition = "2024"
+description = """
+Provides a BsonReader similar to Polars' JsonReader to read in a cursor of MongoDB Bson documents 
+from a collection and a find query into a polars DataFrame.
+"""
+authors = ["trxe <peixianwong@gmail.com>"]
+license = "MIT"
+keywords = ["polars", "bson", "mongodb", "dataframe"]
+categories = ["processing", "data"]
+readme = "README.md"
+repository = "https://github.com/trxe/polars_bson"
 
 [dependencies]
 chrono = "0.4.41"
@@ -16,3 +26,9 @@ dotenvy = "0.15.7"
 [dependencies.polars]
 version = "0.46.0"
 features = ["lazy", "dtype-full", "timezones"]
+
+[lib]
+name = "polars_bson"
+path = "src/lib.rs"
+test = true
+crate-type = ["lib"]
