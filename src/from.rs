@@ -114,6 +114,7 @@ impl From<&Bson> for Wrap<DataType> {
             Bson::DateTime(_) => DataType::Datetime(TimeUnit::Milliseconds, None),
             Bson::ObjectId(_) => DataType::String,
             Bson::Symbol(_) => DataType::String,
+            Bson::Binary(_) => DataType::Binary,
             Bson::Undefined => DataType::Unknown(UnknownKind::Any),
             _ => DataType::String,
         };
@@ -146,7 +147,7 @@ impl<'a> From<Bson> for Wrap<AnyValue<'a>> {
                 let s = Series::new("".into(), &b.bytes);
                 AnyValue::List(s)
             }
-            Bson::ObjectId(oid) => AnyValue::StringOwned(oid.to_string().into()),
+            Bson::ObjectId(oid) => AnyValue::StringOwned(oid.to_hex().into()),
             Bson::Symbol(s) => AnyValue::StringOwned(s.into()),
             v => AnyValue::StringOwned(format!("{v:#?}").into()),
         };
@@ -194,7 +195,7 @@ impl<'a, 'b> From<&'b Bson> for Wrap<AnyValue<'a>> {
 
                 AnyValue::StructOwned(Box::new(vals))
             }
-            Bson::ObjectId(oid) => AnyValue::StringOwned(oid.to_string().into()),
+            Bson::ObjectId(oid) => AnyValue::StringOwned(oid.to_hex().into()),
             Bson::Symbol(s) => AnyValue::StringOwned(s.to_string().into()),
             v => AnyValue::StringOwned(format!("{v:#?}").into()),
         };

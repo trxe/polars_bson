@@ -1,6 +1,6 @@
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
 
-use bson::{Bson, DateTime};
+use bson::{Binary, Bson, DateTime};
 use polars::{
     error::{PolarsError, PolarsResult, polars_bail, polars_err},
     frame::row::AnyValueBuffer,
@@ -138,7 +138,14 @@ impl DataBuffer<'_> {
             String(buf) => {
                 match bson.as_str() {
                     Some(val) => buf.append_value(val),
-                    None => buf.append_null(),
+                    None => {
+                        let p = bson.to_string();
+                        if p.is_empty() {
+                            buf.append_null();
+                        } else {
+                            buf.append_value(p);
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -248,6 +255,7 @@ fn deserialize_all<'a>(
         _ => {}
     }
     let out = match bson {
+        Bson::ObjectId(obj) => AnyValue::StringOwned(obj.to_hex().into()),
         Bson::Array(arr) => {
             let Some(inner_dtype) = dtype.inner_dtype() else {
                 if ignore_errors {
@@ -287,11 +295,6 @@ fn deserialize_all<'a>(
             }
         }
         val => AnyValue::StringOwned(format!("{:#?}", val).into()),
-        // Value::Static(StaticNode::Bool(b)) => AnyValue::Boolean(*b),
-        // Value::Static(StaticNode::I64(i)) => AnyValue::Int64(*i),
-        // Value::Static(StaticNode::U64(u)) => AnyValue::UInt64(*u),
-        // Value::Static(StaticNode::F64(f)) => AnyValue::Float64(*f),
-        // Value::String(s) => AnyValue::StringOwned(s.as_ref().into()),
     };
 
     Ok(out)

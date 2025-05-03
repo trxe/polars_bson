@@ -198,8 +198,8 @@ mod tests {
         };
         let client = mongodb::sync::Client::with_uri_str(modb).expect("client not built");
         let db = client.database(MONGO_DEFAULT_DB);
-        let collection = db.collection::<BsonDoc>("players");
-        let df = BsonReader::new(collection, doc! {"status": "NHL", "team.id": 1})
+        let collection = db.collection::<BsonDoc>("transactions");
+        let df = BsonReader::new(collection, doc! {"team.id": 1})
             .finish()
             .unwrap();
 
@@ -226,8 +226,8 @@ mod tests {
 
         println!("{:?}", df);
 
-        // collection.clone().drop().run().unwrap();
-        // let final_check = collection.clone().find(doc! {}).run().unwrap();
-        // assert!(final_check.collect::<Vec<_>>().is_empty());
+        collection.clone().drop().run().unwrap();
+        let final_check = collection.clone().find(doc! {}).run().unwrap();
+        assert!(final_check.collect::<Vec<_>>().is_empty());
     }
 }

@@ -2075,16 +2075,13 @@ dependencies = [
 name = "polars_bson"
 version = "0.1.0"
 dependencies = [
- "atoi_simd",
  "bson",
  "chrono",
  "dotenvy",
- "fast-float2",
  "mongodb",
  "polars",
  "polars-core",
  "polars-time",
- "simdutf8",
 ]
 
 [[package]]
