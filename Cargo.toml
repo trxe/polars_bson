@@ -9,7 +9,7 @@ from a collection and a find query into a polars DataFrame.
 authors = ["trxe <peixianwong@gmail.com>"]
 license = "MIT"
 keywords = ["polars", "bson", "mongodb", "dataframe"]
-categories = ["processing", "data"]
+categories = ["database"]
 readme = "README.md"
 repository = "https://github.com/trxe/polars_bson"
 
